@@ -3,7 +3,7 @@
 AES-256-GCM | AI | Fuzzy Search | Widget | Backup | Web Dashboard
 GitHub: https://github.com/lamin-16/LaminMemoryPro"""
 
-import os, sys, json, uuid, hashlib, hmac, getpass, argparse, datetime
+import os, sys, json, uuid, hashlib, hmac, getpass, argparse, datetime, time
 import subprocess, difflib, urllib.request, urllib.error, html as _esc
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -36,6 +36,8 @@ VAULT = BASE / "vault.enc"
 META  = BASE / "meta.json"
 SALT  = BASE / "salt.bin"
 ITERS = 310_000
+SESSION = BASE / ".session"
+SESSION_TTL = 3600
 
 class Crypto:
     @staticmethod
@@ -134,11 +136,34 @@ def _now(): return datetime.datetime.now().isoformat()
 def _pw(p="Master Password: "): return getpass.getpass(p)
 def _ready(): return SALT.exists() and META.exists()
 
+def _mkey():
+    return hashlib.sha256((str(os.getuid())+str(Path.home())).encode()).digest()
+
+def _save_sess(key):
+    try:
+        d = json.dumps({"k":key.hex(),"e":time.time()+SESSION_TTL}).encode()
+        SESSION.write_bytes(Crypto.encrypt(d,_mkey())); SESSION.chmod(0o600)
+    except: pass
+
+def _load_sess():
+    try:
+        if not SESSION.exists(): return None
+        d = json.loads(Crypto.decrypt(SESSION.read_bytes(),_mkey()))
+        if d["e"] < time.time(): SESSION.unlink(); return None
+        return bytes.fromhex(d["k"])
+    except: return None
+
 def _open(pw=None):
     if not _ready(): err("No vault. Run: python lamin_memory.py init"); sys.exit(1)
+    sk = _load_sess()
+    if sk:
+        v = Vault(); v.key = sk
+        if VAULT.exists():
+            try: v.db = json.loads(Crypto.decrypt(VAULT.read_bytes(),v.key)); return v
+            except: pass
     v = Vault()
     if not v.unlock(pw or _pw()): err("Wrong password!"); sys.exit(1)
-    return v
+    _save_sess(v.key); return v
 
 def cmd_init(a):
     if _ready():
@@ -240,6 +265,34 @@ def cmd_stats(a):
     print(f"\n{B}{CYN}  -- LaminMemoryPro v2.0.0 Stats --{R}")
     for lbl,val,col in rows: print(f"  {YLW}{lbl:<14}{col}{val}{R}")
     print()
+
+def cmd_lock(a):
+    if SESSION.exists(): SESSION.unlink(); ok("Vault locked.")
+    else: inf("Already locked.")
+
+def cmd_edit(a):
+    v = _open(); n = v.db["notes"].get(a.id)
+    if not n: err(f"ID {a.id!r} not found."); return
+    print(f"{CYN}Title now:   {WHT}{n['title']}{R}")
+    nt = input(f"{YLW}New title (Enter = keep): {R}").strip()
+    if nt: n["title"] = nt
+    print(f"{CYN}Content now:{R}\n{n['content']}")
+    print(f"{YLW}New content (empty line = keep, type to replace):{R}")
+    fl = input()
+    if fl:
+        ls = [fl]
+        while True:
+            l = input()
+            if not l and ls: break
+            ls.append(l)
+        n["content"] = "\n".join(ls)
+    if a.tags:
+        for t in n.get("tags",[]):
+            lst = v.db["tags"].get(t,[])
+            if n["id"] in lst: lst.remove(n["id"])
+        n["tags"] = [x.strip() for x in a.tags.split(",") if x.strip()]
+        for t in n["tags"]: v.db["tags"].setdefault(t,[]).append(n["id"])
+    n["modified"] = _now(); v._save(); ok(f"Note {a.id} updated.")
 
 def cmd_ai(a):
     v = _open()
@@ -369,16 +422,16 @@ def cmd_web(a):
     except KeyboardInterrupt: inf("Server stopped.")
 
 def main():
-    print(BANNER)
     if not HAS_CRYPTO:
         wrn("cryptography missing. Fix: pkg install python-cryptography\n")
     P = argparse.ArgumentParser(prog="lamin_memory.py",
         description="LaminMemoryPro v2.0.0")
     S = P.add_subparsers(dest="cmd")
-    for name in ("init","list","stats","backup","widget"): S.add_parser(name)
+    for name in ("init","list","stats","backup","widget","lock"): S.add_parser(name)
     pa=S.add_parser("add"); pa.add_argument("-t","--title"); pa.add_argument("-c","--content"); pa.add_argument("--tags")
     ps=S.add_parser("show"); ps.add_argument("id")
     pd=S.add_parser("delete"); pd.add_argument("id")
+    ped=S.add_parser("edit"); ped.add_argument("id"); ped.add_argument("--tags")
     pq=S.add_parser("search"); pq.add_argument("query")
     pai=S.add_parser("ai"); pai.add_argument("question",nargs="?"); pai.add_argument("-s","--save",action="store_true")
     pex=S.add_parser("export"); pex.add_argument("-o","--path")
@@ -387,10 +440,11 @@ def main():
     pca=cs.add_parser("add"); pca.add_argument("name"); cs.add_parser("list")
     pcs=cs.add_parser("show"); pcs.add_argument("name")
     a = P.parse_args()
+    if a.cmd in ("init","web","stats",None): print(BANNER)
     if not a.cmd: P.print_help(); return
     dispatch={"init":cmd_init,"add":cmd_add,"list":cmd_list,"show":cmd_show,
         "delete":cmd_delete,"search":cmd_search,"export":cmd_export,"stats":cmd_stats,
-        "ai":cmd_ai,"widget":cmd_widget,"backup":cmd_backup,"web":cmd_web}
+        "ai":cmd_ai,"widget":cmd_widget,"backup":cmd_backup,"web":cmd_web,"lock":cmd_lock,"edit":cmd_edit}
     if a.cmd=="ctx":
         if not getattr(a,"ctx_cmd",None): pc.print_help(); return
         {"add":cmd_ctx_add,"list":cmd_ctx_list,"show":cmd_ctx_show}.get(a.ctx_cmd,lambda _:None)(a)
